@@ -170,6 +170,7 @@ struct World {
     children: Vec<Process>,
     finish: Arc<Notify>,
     first_frame: Arc<Notify>,
+    metrics_address: SocketAddr,
     nemo: Harness,
     requests: Arc<Mutex<Vec<http::HeaderMap>>>,
     task: JoinHandle<()>,
@@ -243,11 +244,12 @@ impl World {
         let reserved_metrics = reserve_address();
         let grpc = reserved_grpc.local_addr().unwrap();
         let frontend = reserved_frontend.local_addr().unwrap();
+        let metrics_address = reserved_metrics.local_addr().unwrap();
         let mut cfg = support::configuration(&nemo.endpoint, translation, 2_097_152);
         configure(&mut cfg);
         cfg.server.grpc_address = grpc.to_string();
         cfg.server.health_address = reserved_health.local_addr().unwrap().to_string();
-        cfg.server.metrics_address = reserved_metrics.local_addr().unwrap().to_string();
+        cfg.server.metrics_address = metrics_address.to_string();
         let config_path = directory.join("extproc.yaml");
         // metrics_auth defaults to enabled and exits when this process has no kubeconfig.
         let config = serde_yaml::to_value(serde_json::json!({
@@ -257,7 +259,7 @@ impl World {
                 "grpc_address": cfg.server.grpc_address,
                 "health_address": cfg.server.health_address,
                 "metrics_address": cfg.server.metrics_address,
-                "max_body_bytes": 2_097_152,
+                "max_body_bytes": cfg.server.max_body_bytes.get(),
                 "metrics_auth": {"enabled": false},
             }
         }))
@@ -291,6 +293,7 @@ impl World {
             children: vec![extproc, proxy],
             finish,
             first_frame,
+            metrics_address,
             nemo,
             requests,
             task,
@@ -342,6 +345,27 @@ impl World {
         assert_eq!(requests.len(), 1);
         assert!(!requests[0].contains_key("x-aigateway-guardrail-input"));
         assert!(!requests[0].contains_key("x-aigateway-guardrail-output"));
+    }
+
+    /// Current `praxis_extproc_body_size_rejections_total` from extproc's
+    /// metrics endpoint. Absent from the page until first incremented, so
+    /// a missing line reads as zero.
+    async fn body_size_rejections(&self) -> u64 {
+        let page = reqwest::Client::builder()
+            .timeout(DEADLINE)
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{}/metrics", self.metrics_address))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        page.lines()
+            .find_map(|line| line.strip_prefix("praxis_extproc_body_size_rejections_total "))
+            .map_or(0, |value| value.trim().parse().unwrap())
     }
 }
 
@@ -449,6 +473,9 @@ async fn backend_response(
 
 #[derive(Clone, Copy)]
 struct EnvoyModes<'a> {
+    /// Envoy's listener `per_connection_buffer_limit_bytes`; `None` keeps
+    /// Envoy's default (~1 MiB), which BUFFERED bodies cannot exceed.
+    buffer_limit: Option<u32>,
     no_header_wait: bool,
     request: &'a str,
     request_trailers: &'a str,
@@ -458,6 +485,7 @@ struct EnvoyModes<'a> {
 impl<'a> EnvoyModes<'a> {
     fn new(request: &'a str, response: &'a str, no_header_wait: bool) -> Self {
         Self {
+            buffer_limit: None,
             no_header_wait,
             request,
             request_trailers: "SEND",
@@ -495,11 +523,15 @@ fn envoy_config(
     let cluster = |name: &str, endpoint: SocketAddr| json!({"name":name,"type":"STATIC","connect_timeout":"2s","load_assignment":{"cluster_name":name,"endpoints":[{"lb_endpoints":[{"endpoint":{"address":address(endpoint.port())}}]}]}});
     let mut processor = cluster("extproc", grpc);
     processor["http2_protocol_options"] = json!({});
-    json!({"static_resources":{
+    let mut config = json!({"static_resources":{
         "listeners":[{"name":"http","address":address(frontend.port()),"filter_chains":[{"filters":[{"name":"envoy.filters.network.http_connection_manager","typed_config":{
             "@type":"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager","stat_prefix":"test","http_protocol_options":{"enable_trailers":true},"route_config":{"name":"test","virtual_hosts":[{"name":"all","domains":["*"],"routes":[{"match":{"prefix":"/"},"route":{"cluster":"backend","timeout":"0s"}}]}]},
             "http_filters":[{"name":"envoy.filters.http.ext_proc","typed_config":extproc_filter_config(modes)},{"name":"envoy.filters.http.router","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}}]
-        }}]}]}],"clusters":[processor,cluster("backend", backend)]}})
+        }}]}]}],"clusters":[processor,cluster("backend", backend)]}});
+    if let Some(limit) = modes.buffer_limit {
+        config["static_resources"]["listeners"][0]["per_connection_buffer_limit_bytes"] = json!(limit);
+    }
+    config
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -748,4 +780,115 @@ async fn envoy_preserves_appended_request_headers_and_response_cookies() {
             assert!(world.nemo.calls().is_empty());
         }
     }
+}
+
+/// TEMPORARY PROBES (#204) — not for the PR. They observe, they do not assert.
+///
+/// Probe 1: the limit edges on the unguarded route, with Envoy's own buffer
+/// limit raised out of the way. One test, so the output prints in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_edges_unguarded() {
+    const MIB: usize = 1024 * 1024;
+    for limit in [10 * MIB, 32 * MIB] {
+        for (name, body_len) in [("limit - 1", limit - 1), ("exactly limit", limit), ("limit + 1", limit + 1)] {
+            let label = format!("{} MiB limit, body {name}", limit / MIB);
+            probe(&label, "BUFFERED", false, false, limit, body_len, Some(64 * 1024 * 1024)).await;
+        }
+    }
+}
+
+/// Probe 2, the positive control: a body over extproc's limit but under
+/// Envoy's default, so extproc must reject and the counter must move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_control_extproc_rejects() {
+    probe("control: 300 KiB over a 256 KiB limit", "BUFFERED", false, false, 256 * 1024, 300 * 1024, None).await;
+}
+
+/// Probe 3: the guarded route. The input guardrail buffers at most 1 MiB,
+/// so that is the limit in play; extproc's own limit stays at the 32 MiB
+/// default and Envoy's is raised, so neither can interfere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_edges_guarded() {
+    const GUARDRAIL_LIMIT: usize = 1024 * 1024;
+    for mode in ["BUFFERED", "FULL_DUPLEX_STREAMED"] {
+        for (name, body_len) in [
+            ("limit - 1", GUARDRAIL_LIMIT - 1),
+            ("exactly limit", GUARDRAIL_LIMIT),
+            ("limit + 1", GUARDRAIL_LIMIT + 1),
+        ] {
+            let label = format!("{mode}, guarded 1 MiB, body {name}");
+            probe(&label, mode, true, false, 32 * 1024 * 1024, body_len, Some(64 * 1024 * 1024)).await;
+        }
+    }
+}
+
+/// Probe 4: as probe 3, but with the output guardrail removed from the
+/// chain, so the input guardrail's 1 MiB is the only filter limit left.
+/// If the cap now holds, "largest filter limit wins" is what overrode it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_edges_guarded_input_only() {
+    const GUARDRAIL_LIMIT: usize = 1024 * 1024;
+    for mode in ["BUFFERED", "FULL_DUPLEX_STREAMED"] {
+        for (name, body_len) in [
+            ("limit - 1", GUARDRAIL_LIMIT - 1),
+            ("exactly limit", GUARDRAIL_LIMIT),
+            ("limit + 1", GUARDRAIL_LIMIT + 1),
+        ] {
+            let label = format!("{mode}, INPUT GUARDRAIL ONLY, body {name}");
+            probe(&label, mode, true, true, 32 * 1024 * 1024, body_len, Some(64 * 1024 * 1024)).await;
+        }
+    }
+}
+
+/// Send one body of `body_len` bytes with extproc's limit set to `limit`
+/// (input guardrail selected when `guard_input` is true), and print what
+/// happened.
+async fn probe(
+    label: &str,
+    mode: &str,
+    guard_input: bool,
+    drop_output_guardrail: bool,
+    limit: usize,
+    body_len: usize,
+    envoy_buffer_limit: Option<u32>,
+) {
+    let mut modes = EnvoyModes::new(mode, mode, false);
+    modes.buffer_limit = envoy_buffer_limit;
+    let world = World::configured(modes, NemoReply::Pass, false, |cfg| {
+        cfg.server.max_body_bytes = praxis_extproc::config::MaxBodyBytes::try_from(limit).unwrap();
+        if drop_output_guardrail {
+            cfg.filter_chains[0].filters.retain(|entry| {
+                !(entry.filter_type == "ai_guardrails" && entry.config["phase"]["response"].as_bool() == Some(true))
+            });
+        }
+    })
+    .await;
+
+    let mut body =
+        serde_json::to_vec(&json!({"model":"test","messages":[{"role":"user","content":"hello"}]})).unwrap();
+    body.resize(body_len, b' ');
+
+    let before = world.body_size_rejections().await;
+    let mut request = reqwest::Client::builder()
+        .timeout(DEADLINE)
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(&world.url)
+        .header("content-type", "application/json")
+        .body(body);
+    if guard_input {
+        request = request.header("x-aigateway-guardrail-input", "true");
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    let after = world.body_size_rejections().await;
+
+    println!("--- {label}");
+    println!("status:             {status}");
+    println!("extproc rejections: {before} -> {after}");
+    println!("backend requests:   {}", world.requests.lock().unwrap().len());
+    println!("nemo calls:         {}", world.nemo.calls().len());
+    println!("response body:      {}", text.chars().take(200).collect::<String>());
 }
